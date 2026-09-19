@@ -1,0 +1,11 @@
+{
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/build/debug/compile_commands.json",
+    "C_Cpp.default.compilerPath": "${userHome}/.local/share/arm-gnu-toolchain-15.3.rel1-x86_64-arm-none-eabi/bin/arm-none-eabi-gcc",
+    "C_Cpp.files.exclude": {
+        "**/.vscode": true,
+        "**/.vs": true,
+        "build/**/_deps/*/examples": true,
+        "build/**/_deps/*/test": true
+    }
+}
