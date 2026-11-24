@@ -23,6 +23,33 @@ void initialize_hal_timebase()
 
 } // namespace
 
+namespace {
+
+void isolate_unused_discovery_chips() { //basically tri-state the unused chips on the discovery board to reduce power consumption and avoid bus contention
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+    // 1) Hold Discovery CS43L22 Audio DAC (I2C1 addr 0x4A) in reset: PD4 = LOW
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_4, GPIO_PIN_RESET);
+    GPIO_InitTypeDef pd4{};
+    pd4.Pin   = GPIO_PIN_4;
+    pd4.Mode  = GPIO_MODE_OUTPUT_PP;
+    pd4.Pull  = GPIO_NOPULL;
+    pd4.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOD, &pd4);
+
+    // 2) Tri-state Discovery LIS302DL/LIS3DSH accel (shares PA5 SCK / PA7 RMII): PE3 = HIGH
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_3, GPIO_PIN_SET);
+    GPIO_InitTypeDef pe3{};
+    pe3.Pin   = GPIO_PIN_3;
+    pe3.Mode  = GPIO_MODE_OUTPUT_PP;
+    pe3.Pull  = GPIO_NOPULL;
+    pe3.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOE, &pe3);
+}
+
+} // namespace
+
 extern "C" std::uint32_t HAL_GetTick()
 {
     if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {

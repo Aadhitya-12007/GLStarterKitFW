@@ -15,6 +15,7 @@ add_library(stm32f4_hal STATIC
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_eth.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_gpio.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_i2c.c
+    stm32f4xx-hal-driver/Src/stm32f4xx_hal_i2c_ex.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_pwr.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_pwr_ex.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_rcc.c
