@@ -7,5 +7,6 @@
         "**/.vs": true,
         "build/**/_deps/*/examples": true,
         "build/**/_deps/*/test": true
-    }
+    },
+    "C_Cpp.errorSquiggles": "enabled"
 }

@@ -19,8 +19,10 @@ add_library(stm32f4_hal STATIC
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_pwr.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_pwr_ex.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_rcc.c
+    stm32f4xx-hal-driver/Src/stm32f4xx_hal_spi.c
     stm32f4xx-hal-driver/Src/stm32f4xx_hal_uart.c
 )
+
 target_include_directories(stm32f4_hal PUBLIC ${PROJECT_SOURCE_DIR}/config)
 target_include_directories(stm32f4_hal SYSTEM PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/stm32f4xx-hal-driver/Inc
