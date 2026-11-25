@@ -63,6 +63,10 @@ void Ui::on_button_event(const stm32f407::ButtonEvent& event) {
             screen_ = (screen_ + 1) % kScreenCount; // Next view
             break;
 
+        case stm32f407::Button::SW4:
+            edr_.request_tamper(); // Flip 1 bit in latest Flash sector
+            break;
+
         default:
             break;
     }
@@ -95,13 +99,19 @@ void Ui::render_edr_status() {
     if (g100 < 0)   g100 = 0;
     if (g100 > 999) g100 = 999; // Keep "G:X.XX" within 6 characters
 
-    snprintf(line0, sizeof(line0), "EDR:%-6s  E:%02lu",
+    // Exact 16 chars: e.g. "DISARM EVENTS: 2" or "ARMED  EVENTS: 2"
+    snprintf(line0, sizeof(line0), "%-6s EVENTS:%2lu",
              state_label(edr_.state()),
              static_cast<unsigned long>(edr_.event_count()));
 
-    snprintf(line1, sizeof(line1), "G:%d.%02d  LAST:%3s",
-             g100 / 100, g100 % 100,
-             trigger_label(edr_.last_trigger()));
+    if (edr_.chain_ok()) {
+        snprintf(line1, sizeof(line1), "G:%d.%02d  LAST:%3s",
+                 g100 / 100, g100 % 100,
+                 trigger_label(edr_.last_trigger()));
+    } else {
+        snprintf(line1, sizeof(line1), "G:%d.%02d  TAMPER! ",
+                 g100 / 100, g100 % 100);
+    }
 
     write_line(0, line0);
     write_line(1, line1);
@@ -137,8 +147,15 @@ void Ui::render_last_event() {
 }
 
 void Ui::render_controls() {
-    write_line(0, "192.168.137.42");
-    write_line(1, "SW2:ARM SW1/3:PG");
+    char line0[17];
+    const auto& mac = edr_.device_mac();
+
+    // Exact 16 chars: "MAC:AABBCCDDEEFF"
+    snprintf(line0, sizeof(line0), "MAC:%02X%02X%02X%02X%02X%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    write_line(0, line0);
+    write_line(1, "SW2:ARM SW4:TMPR");
 }
 
 void Ui::write_line(std::uint8_t row, const char* text) {

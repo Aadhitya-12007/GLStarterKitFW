@@ -5,10 +5,12 @@ extern "C" {
 
 #include <printf/printf.h>
 
+#include "stm32f407/blackbox_storage.hpp"
 #include "stm32f407/board.hpp"
 #include "stm32f407/console.hpp"
 #include "stm32f407/device_id.hpp"
 #include "stm32f407/dht11.hpp"
+#include "stm32f407/hw_security.hpp"
 #include "stm32f407/i2c1_bus.hpp"
 #include "stm32f407/imu_driver.hpp"
 #include "stm32f407/keyboard.hpp"
@@ -42,10 +44,11 @@ stm32f407::Dht11 climate_sensor;
 
 stm32f407::I2c1Bus i2c1_bus;
 stm32f407::ImuDriver imu{i2c1_bus};
-EdrController edr{imu};
+stm32f407::BlackBoxStorage storage{i2c1_bus};
+EdrController edr_controller{imu, storage};
 
 stm32f407::Wh1602 display;
-ui::Ui user_interface{display, edr};
+ui::Ui user_interface{display, edr_controller};
 
 } // namespace
 
@@ -60,13 +63,31 @@ int main() {
         stm32f407::halt();
     }
 
-    printf("hello %d\n", 1);
+    printf("BlackBox-EDR booting...\n");
 
+    // 1. Initialize shared I2C1 bus and LSM9DS1 IMU
     if (!i2c1_bus.init() || !imu.init()) {
         printf("IMU init failed!\n");
     }
 
-    // The UI's task must exist before any of its sources can report to it.
+    // 2. Initialize SPI1 SST25VF016B Flash (JEDEC ID + unlock) and read EUI-48 MAC
+    if (storage.init()) {
+        const auto& mac = storage.cached_mac();
+        printf("Storage OK | MAC=%02X:%02X:%02X:%02X:%02X:%02X\n",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        printf("BlackBoxStorage init failed!\n");
+    }
+
+    // 3. Enable STM32 Hardware CRC-32 & Hardware RNG, then recover Flash chain
+    stm32f407::hw_security::init();
+    edr_controller.restore_from_flash();
+    printf("Flash recovery: EVENTS=%lu CHAIN=%s SEED=0x%08lX\n",
+           static_cast<unsigned long>(edr_controller.event_count()),
+           edr_controller.chain_ok() ? "OK" : "TAMPER",
+           static_cast<unsigned long>(edr_controller        .chain_seed()));
+
+    // 4. Start UI before sources/listeners report to it
     if (!user_interface.start()
         || !keyboard.add_listener(user_interface)) {
         stm32f407::halt();
@@ -98,7 +119,7 @@ int main() {
     }
 
     climate_sensor.start();
-    edr.start();
+    edr_controller.start();
 
     printf("Starting FreeRTOS scheduler\n");
 
