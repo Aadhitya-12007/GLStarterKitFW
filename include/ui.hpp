@@ -1,78 +1,45 @@
 #pragma once
 
-#include <array>
-#include <cstddef>
 #include <cstdint>
-#include <optional>
-
-#include "ethernet.hpp"
-#include "mqtt_client.hpp"
-#include "stm32f407/dht11.hpp"
-#include "stm32f407/keyboard.hpp"
-#include "stm32f407/wh1602.hpp"
 
 extern "C" {
 #include "FreeRTOS.h"
 #include "task.h"
 }
 
+#include "edr_controller.hpp"
+#include "stm32f407/keyboard.hpp"
+#include "stm32f407/wh1602.hpp"
+
 namespace ui {
 
-// Shows one Screen at a time on the Display, starting on the Network Screen;
-// SW1 moves forward and SW3 back, wrapping at both ends. Listeners only record
-// what they hear; the UI's own task does all drawing.
-class Ui final : public stm32f407::IHumidityListener,
-                 public stm32f407::ITemperatureListener,
-                 public stm32f407::IButtonListener,
-                 public network::ILinkStateClient,
-                 public network::IBrokerConnectionListener {
+class Ui : public stm32f407::IButtonListener {
 public:
-    Ui(stm32f407::Wh1602& display, const std::array<std::uint8_t, 4>& ip);
+    Ui(stm32f407::Wh1602& display, EdrController& edr);
 
-    Ui(const Ui&) = delete;
-    Ui& operator=(const Ui&) = delete;
-    Ui(Ui&&) = delete;
-    Ui& operator=(Ui&&) = delete;
-
-    // Must run before any of the UI's sources start.
+    // Creates the LCD refresh task. Call before vTaskStartScheduler().
     bool start();
 
-    void on_humidity_changed(std::uint8_t humidity) override;
-    void on_temperature_changed(std::int16_t temperature) override;
+    // Called from Keyboard task when SW1..SW5 are pressed/released.
     void on_button_event(const stm32f407::ButtonEvent& event) override;
-    void on_link_state_changed(network::LinkState state) override;
-    void on_broker_connection_changed(bool connected) override;
 
 private:
-    enum class Screen : std::uint8_t {
-        NETWORK,
-        TEMPERATURE,
-        HUMIDITY,
-    };
+    static constexpr int kScreenCount = 3;
 
-    static constexpr std::size_t screen_count = 3U;
-
-    struct State {
-        Screen screen = Screen::NETWORK;
-        bool link_up = false;
-        bool broker_connected = false;
-        std::optional<std::int16_t> temperature;
-        std::optional<std::uint8_t> humidity;
-    };
-
-    using Line = std::array<char, stm32f407::Wh1602::columns>;
-
-    static void task_entry(void* context);
-
+    static void task_entry(void* arg);
     void run();
-    void draw(const State& state);
-    template <typename Update>
-    void change(Update update);
+
+    void render_edr_status();
+    void render_last_event();
+    void render_controls();
+    void write_line(std::uint8_t row, const char* text);
 
     stm32f407::Wh1602& display_;
-    Line ip_line_{};
-    TaskHandle_t task_ = nullptr;
-    State state_;
+    EdrController&     edr_;
+    TaskHandle_t       task_handle_ = nullptr;
+
+    // Written by Keyboard task (SW1/SW3), read by Ui task.
+    volatile int screen_ = 0;
 };
 
 } // namespace ui

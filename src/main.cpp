@@ -1,5 +1,6 @@
 extern "C" {
 #include "FreeRTOS.h"
+#include "task.h"
 }
 
 #include <printf/printf.h>
@@ -8,9 +9,12 @@ extern "C" {
 #include "stm32f407/console.hpp"
 #include "stm32f407/device_id.hpp"
 #include "stm32f407/dht11.hpp"
+#include "stm32f407/i2c1_bus.hpp"
+#include "stm32f407/imu_driver.hpp"
 #include "stm32f407/keyboard.hpp"
 #include "stm32f407/wh1602.hpp"
 
+#include "edr_controller.hpp"
 #include "ethernet.hpp"
 #include "humidity_publisher.hpp"
 #include "leds_controller.hpp"
@@ -36,13 +40,16 @@ LedsController leds_controller{mqtt_client, device_id};
 
 stm32f407::Dht11 climate_sensor;
 
+stm32f407::I2c1Bus i2c1_bus;
+stm32f407::ImuDriver imu{i2c1_bus};
+EdrController edr{imu};
+
 stm32f407::Wh1602 display;
-ui::Ui user_interface{display, Settings::ethernet_config.ip};
+ui::Ui user_interface{display, edr};
 
 } // namespace
 
-int main()
-{
+int main() {
     if (!stm32f407::initialize_system_clock()) {
         stm32f407::halt();
     }
@@ -52,46 +59,48 @@ int main()
     if (!stm32f407::start_console()) {
         stm32f407::halt();
     }
-    
+
     printf("hello %d\n", 1);
 
+    if (!i2c1_bus.init() || !imu.init()) {
+        printf("IMU init failed!\n");
+    }
+
     // The UI's task must exist before any of its sources can report to it.
-    if (!user_interface.start() 
+    if (!user_interface.start()
         || !keyboard.add_listener(user_interface)) {
         stm32f407::halt();
     }
 
-    if (!leds_controller.start() 
-        || !keyboard.add_listener(leds_controller)){
+    // Keep leds_controller.start() for PD12-PD15 GPIO init,
+    // but detach SW2 so SW2 exclusively controls EDR Arm/Disarm.
+    if (!leds_controller.start()) {
         stm32f407::halt();
     }
     keyboard.start();
 
-    if (!ethernet.start() 
-        || !echo_server.start() 
-        || !ethernet.add_link_state_client(echo_server)
-        || !ethernet.add_link_state_client(user_interface)) {
+    if (!ethernet.start()
+        || !echo_server.start()
+        || !ethernet.add_link_state_client(echo_server)) {
         stm32f407::halt();
     }
 
-    if (!mqtt_client.add_broker_connection_listener(user_interface)
-        || !mqtt_client.start() 
+    if (!mqtt_client.start()
         || !ethernet.add_link_state_client(mqtt_client)
         || !temperature_publisher.start()
         || !humidity_publisher.start()) {
         stm32f407::halt();
     }
 
-    if (!climate_sensor.add_humidity_listener( humidity_publisher,Settings::humidity_reporting_threshold) 
-        || !climate_sensor.add_temperature_listener(temperature_publisher, Settings::temperature_reporting_threshold)
-        || !climate_sensor.add_humidity_listener(user_interface, Settings::ui_humidity_threshold) 
-        || !climate_sensor.add_temperature_listener(user_interface, Settings::ui_temperature_threshold)) {
+    if (!climate_sensor.add_humidity_listener(humidity_publisher, Settings::humidity_reporting_threshold)
+        || !climate_sensor.add_temperature_listener(temperature_publisher, Settings::temperature_reporting_threshold)) {
         stm32f407::halt();
     }
 
     climate_sensor.start();
+    edr.start();
 
-     printf("Starting FreeRTOS scheduller\n");
+    printf("Starting FreeRTOS scheduler\n");
 
     vTaskStartScheduler();
     stm32f407::halt();

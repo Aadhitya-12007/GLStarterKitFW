@@ -21,6 +21,7 @@ target_compile_options(freertos_plus_tcp_utilities PRIVATE
 )
 
 add_executable(${PROJECT_NAME}
+    src/edr_controller.cpp
     src/errors.cpp
     src/ethernet.cpp
     src/humidity_publisher.cpp
