@@ -11,7 +11,7 @@ public:
         count_ = 0U;
     }
 
-    // Overwrites the oldest item once full. O(1) time, zero heap.
+    // Overwrites the oldest item once full. O(1)
     void push(const T& item) noexcept {
         data_[head_] = item;
         head_ = (head_ + 1U) % Capacity;
@@ -20,13 +20,15 @@ public:
         }
     }
 
-    // Copies samples into `out` in chronological order (oldest -> newest).
-    // Index 0..99 = 2.0 s pre-trigger, index 100..149 = 1.0 s post-trigger.
-    void copy_chronological(std::array<T, Capacity>& out) const noexcept {
-        out.fill(T{});
+    // Unrolls samples chronologically (oldest -> newest) directly into CrashRecord::samples.
+    // Index 0..99 = 2.0 s pre-shock, index 100..149 = 1.0 s post-shock.
+    void copy_chronological(T* dst) const noexcept {
+        for (std::size_t i = 0U; i < Capacity; ++i) {
+            dst[i] = T{};
+        }
         const std::size_t start = (count_ < Capacity) ? 0U : head_;
         for (std::size_t i = 0U; i < count_; ++i) {
-            out[i] = data_[(start + i) % Capacity];
+            dst[i] = data_[(start + i) % Capacity];
         }
     }
 
@@ -34,6 +36,6 @@ public:
 
 private:
     std::array<T, Capacity> data_{};
-    std::size_t head_{0U};   // Next slot to write
+    std::size_t head_{0U};   // Next slot to write (also the oldest slot once full)
     std::size_t count_{0U};  // Number of valid samples stored (0..Capacity)
 };
