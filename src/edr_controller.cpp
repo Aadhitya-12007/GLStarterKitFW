@@ -1,22 +1,18 @@
 #include "edr_controller.hpp"
 
 #include <cmath>
-#include <cstddef>
 #include <cstring>
 
 extern "C" {
 #include "stm32f4xx_hal.h"
 }
 
-#include "stm32f407/hw_security.hpp"
-
 namespace {
-constexpr uint32_t kPeriodMs      = 20;    // 50 Hz sampling cadence
-constexpr float    kShockLimitSq  = 6.25f; // 2.5g * 2.5g
-constexpr int      kPostTicks     = 50;    // 1.0 s post-impact capture
-constexpr int      kTiltDebounce  = 5;     // 100 ms sustained tilt (>45 deg)
-constexpr int      kCooldownTicks = 75;    // 1.5 s lockout after an event
-constexpr int      kLedBlinkTicks = 30;    // 600 ms total -> 3 red flashes
+constexpr uint32_t kPeriodMs      = 20U;   // 50 Hz sampling cadence
+constexpr uint32_t kFlashSector   = 0U;    // Single-slot storage (Sector 0)
+constexpr float    kShockLimitSq  = 6.25f; // 2.5 g * 2.5 g
+constexpr int      kPostTicks     = 50;    // 1.0 s post-shock capture
+constexpr int      kCooldownTicks = 50;    // 1.0 s lockout after saving
 } // namespace
 
 EdrController::EdrController(stm32f407::ImuDriver& imu,
@@ -28,16 +24,16 @@ void EdrController::start() {
                 tskIDLE_PRIORITY + 2, &task_handle_);
 }
 
-void EdrController::toggle_arm() {
-    armed_cmd_ = !armed_cmd_;
-}
+void EdrController::toggle_arm()          { armed_cmd_  = !armed_cmd_; }
+void EdrController::set_armed(bool armed) { armed_cmd_  = armed; }
+void EdrController::request_tamper()      { tamper_cmd_ = true; }
 
-void EdrController::set_armed(bool armed) {
-    armed_cmd_ = armed;
-}
-
-void EdrController::request_tamper() {
-    tamper_cmd_ = true;
+bool EdrController::take_crash_ready() {
+    if (!crash_ready_) {
+        return false;
+    }
+    crash_ready_ = false;
+    return true;
 }
 
 void EdrController::task_entry(void* arg) {
@@ -45,250 +41,172 @@ void EdrController::task_entry(void* arg) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Cold-Boot Recovery: Scan Flash, Recover Seed/Count, Verify CRC-32 Chain
+// Hardware Helpers: STM32F407 CRC-32 Unit (RM0090 Section 4) & Red LED (PD14)
 // ---------------------------------------------------------------------------
-void EdrController::restore_from_flash() {
-    if (!storage_.is_ready()) {
-        stm32f407::hw_security::generate_random_u32(chain_seed_);
-        last_crc32_ = chain_seed_;
-        return;
+uint32_t EdrController::compute_crc32(const void* data, std::size_t len_bytes) {
+    __HAL_RCC_CRC_CLK_ENABLE();
+    CRC->CR = CRC_CR_RESET; // Resets CRC_DR to 0xFFFFFFFF (poly 0x04C11DB7)
+
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (std::size_t i = 0U; i + 4U <= len_bytes; i += 4U) {
+        uint32_t word = 0U;
+        std::memcpy(&word, bytes + i, sizeof(word));
+        CRC->DR = word;
     }
+    return CRC->DR;
+}
 
-    const uint32_t count = storage_.scan_valid_records(edr::kRecordMagic, kMaxEvents);
-
-    if (count == 0U) {
-        // Fresh/empty Flash: seed the chain with a true 32-bit Hardware RNG nonce
-        stm32f407::hw_security::generate_random_u32(chain_seed_);
-        last_crc32_      = chain_seed_;
-        event_count_     = 0U;
-        chain_ok_        = true;
-        broken_event_id_ = 0U;
-        return;
-    }
-
-    // Verify all stored sectors 0..(count-1) and restore chain_seed_ + last_crc32_
-    verify_chain(count);
-
-    // record_buf_ now holds the latest sector (count - 1); restore UI snapshot too
-    event_count_           = count;
-    last_trigger_          = static_cast<Trigger>(record_buf_.trigger_type);
-    snapshot_.event_id     = record_buf_.event_id;
-    snapshot_.timestamp_ms = record_buf_.timestamp_ms;
-    snapshot_.trigger      = last_trigger_;
-    snapshot_.peak_g       = static_cast<float>(record_buf_.peak_g_x100) * 0.01f;
-    std::memcpy(snapshot_.samples.data(), record_buf_.samples, sizeof(record_buf_.samples));
+void EdrController::set_red_led(bool on) {
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
 // ---------------------------------------------------------------------------
-// 2. Main 50 Hz FreeRTOS Task Loop
+// 1. Boot Recovery: Load Sector 0 & Verify Hardware CRC-32
+// ---------------------------------------------------------------------------
+void EdrController::load_from_flash() {
+    std::memset(&record_, 0, sizeof(record_));
+    has_crash_   = false;
+    crc_ok_      = true;
+    event_count_ = 0U;
+
+    if (!storage_.is_ready()) {
+        set_red_led(false);
+        return;
+    }
+
+    if (!storage_.read_sector(kFlashSector,
+                              reinterpret_cast<uint8_t*>(&record_),
+                              sizeof(record_))) {
+        std::memset(&record_, 0, sizeof(record_));
+        set_red_led(false);
+        return;
+    }
+
+    if (record_.magic == edr::kRecordMagic) {
+        const uint32_t calc = compute_crc32(&record_, offsetof(edr::CrashRecord, crc32));
+        has_crash_   = true;
+        crc_ok_      = (calc == record_.crc32);
+        event_count_ = record_.event_id;
+        set_red_led(!crc_ok_); // Solid ON immediately if Flash was tampered before reboot
+    } else {
+        std::memset(&record_, 0, sizeof(record_));
+        set_red_led(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Main 50 Hz FreeRTOS Loop (Accelerometer-Only Shock FSM)
 // ---------------------------------------------------------------------------
 void EdrController::run() {
     TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
-        // 1. Service SW4 tamper simulation request safely outside active capture
+        // Service SW4 tamper request safely when not capturing a crash
         if (tamper_cmd_ && state_ != State::POST_CAPTURE) {
             tamper_cmd_ = false;
             simulate_tamper();
+            last_wake = xTaskGetTickCount(); // Re-sync cadence after SPI Flash write
         }
 
-        // 2. Non-blocking Red LED (PD14) flasher: 5 ticks ON / 5 ticks OFF
-        if (led_ticks_ > 0) {
-            --led_ticks_;
-            bool on = ((led_ticks_ / 5) % 2) == 1;
-            HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
-        } else {
-            HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_RESET);
-        }
-
-        // 3. Read 6-axis IMU sample over I2C1 and push into 3-second ring buffer
+        // Read 3-axis accelerometer sample and keep the 3-second ring buffer warm
         stm32f407::ImuSample s{};
         if (imu_.read_sample(s)) {
             ring_.push(s);
 
-            float ax = stm32f407::ImuDriver::raw_to_g(s.ax);
-            float ay = stm32f407::ImuDriver::raw_to_g(s.ay);
-            float az = stm32f407::ImuDriver::raw_to_g(s.az);
-
-            float xy_sq = ax * ax + ay * ay;
-            float z_sq  = az * az;
-            float g_sq  = xy_sq + z_sq;
-            float g_now = std::sqrt(g_sq);
+            const float ax    = stm32f407::ImuDriver::raw_to_g(s.ax);
+            const float ay    = stm32f407::ImuDriver::raw_to_g(s.ay);
+            const float az    = stm32f407::ImuDriver::raw_to_g(s.az);
+            const float g_sq  = (ax * ax) + (ay * ay) + (az * az);
+            const float g_now = std::sqrt(g_sq);
             live_g_ = g_now;
 
-            // 4. Apply SW2 Arm/Disarm button state
+            // Apply Arm / Disarm command from SW2 or MQTT
             if (!armed_cmd_) {
                 state_          = State::DISARMED;
                 post_ticks_     = 0;
-                tilt_ticks_     = 0;
                 cooldown_ticks_ = 0;
             } else if (state_ == State::DISARMED) {
                 state_          = State::ARMED;
-                tilt_ticks_     = 0;
                 cooldown_ticks_ = 0;
             }
 
-            // 5. Execute 3-state FSM
+            // 3-state FSM: DISARMED <-> ARMED -> POST_CAPTURE -> ARMED
             if (state_ == State::ARMED) {
                 if (cooldown_ticks_ > 0) {
                     --cooldown_ticks_;
-                } else {
-                    bool shock = (g_sq > kShockLimitSq);
-
-                    // Tilt > 45 deg: tan(45) = 1 => ax^2 + ay^2 > az^2 (sustained 100 ms)
-                    if (g_sq > 0.25f && xy_sq > z_sq) {
-                        ++tilt_ticks_;
-                    } else {
-                        tilt_ticks_ = 0;
-                    }
-                    bool tilt = (tilt_ticks_ >= kTiltDebounce);
-
-                    if (shock || tilt) {
-                        active_trigger_  = shock ? Trigger::SHOCK : Trigger::TILT;
-                        peak_g_          = g_now;
-                        trigger_time_ms_ = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                        post_ticks_      = kPostTicks;
-                        tilt_ticks_      = 0;
-                        state_           = State::POST_CAPTURE;
-                    }
+                } else if (g_sq > kShockLimitSq) {
+                    peak_g_     = g_now;
+                    post_ticks_ = kPostTicks;
+                    state_      = State::POST_CAPTURE;
                 }
             } else if (state_ == State::POST_CAPTURE) {
                 if (g_now > peak_g_) {
                     peak_g_ = g_now;
                 }
                 if (--post_ticks_ <= 0) {
-                    save_snapshot();
+                    save_crash();
                     cooldown_ticks_ = kCooldownTicks;
                     state_          = State::ARMED;
+                    last_wake       = xTaskGetTickCount(); // Re-sync after Flash write
                 }
             }
         }
 
-        // 6. Sleep until the exact next 20 ms boundary (50 Hz)
+        // Red LED (PD14): solid ON during 1 s POST_CAPTURE or when tampered, else OFF
+        const bool led_on = (state_ == State::POST_CAPTURE) || (has_crash_ && !crc_ok_);
+        set_red_led(led_on);
+
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(kPeriodMs));
     }
 }
 
 // ---------------------------------------------------------------------------
-// 3. Chain Verifier: Recomputes STM32 HW CRC-32 Across Every Stored Sector
+// 3. Unroll RingBuffer -> Hardware CRC-32 -> Write Sector 0 -> Flag MQTT
 // ---------------------------------------------------------------------------
-void EdrController::verify_chain(uint32_t count) {
-    bool     all_ok      = true;
-    uint32_t first_bad   = 0U;
-    uint32_t expect_prev = 0U;
+void EdrController::save_crash() {
+    const uint32_t next_id = event_count_ + 1U;
 
-    for (uint32_t slot = 0U; slot < count; ++slot) {
-        if (!storage_.read_sector(slot,
-                                  reinterpret_cast<uint8_t*>(&record_buf_),
-                                  sizeof(record_buf_))) {
-            all_ok    = false;
-            first_bad = slot + 1U;
-            break;
-        }
+    record_.magic    = edr::kRecordMagic;
+    record_.event_id = next_id;
+    record_.peak_g   = peak_g_;
+    ring_.copy_chronological(record_.samples);
+    record_.crc32    = compute_crc32(&record_, offsetof(edr::CrashRecord, crc32));
 
-        if (slot == 0U) {
-            // Event #1 carries the persistent Hardware RNG genesis seed
-            chain_seed_ = record_buf_.prev_crc32;
-            expect_prev = chain_seed_;
-        }
-
-        const uint32_t calc_crc = stm32f407::hw_security::compute_crc32(
-            &record_buf_, offsetof(edr::IncidentRecord, record_crc32));
-
-        const bool id_ok   = (record_buf_.event_id == (slot + 1U));
-        const bool link_ok = (record_buf_.prev_crc32 == expect_prev);
-        const bool crc_ok  = (record_buf_.record_crc32 == calc_crc);
-
-        if (!(id_ok && link_ok && crc_ok) && all_ok) {
-            all_ok    = false;
-            first_bad = slot + 1U;
-        }
-
-        // Advance chain pointer for the next record
-        expect_prev = record_buf_.record_crc32;
+    if (storage_.is_ready()) {
+        storage_.write_sector(kFlashSector,
+                              reinterpret_cast<const uint8_t*>(&record_),
+                              sizeof(record_));
     }
 
-    last_crc32_      = expect_prev;
-    chain_ok_        = all_ok;
-    broken_event_id_ = first_bad;
+    event_count_ = next_id;
+    has_crash_   = true;
+    crc_ok_      = true;
+    set_red_led(false);
+    crash_ready_ = true;
 }
 
 // ---------------------------------------------------------------------------
-// 4. Seal & Commit Snapshot to SST25VF016B Flash (end of POST_CAPTURE)
-// ---------------------------------------------------------------------------
-void EdrController::save_snapshot() {
-    const uint32_t slot   = event_count_;
-    const uint32_t new_id = slot + 1U;
-
-    // Update RAM snapshot for Screen 1
-    snapshot_.event_id     = new_id;
-    snapshot_.timestamp_ms = trigger_time_ms_;
-    snapshot_.trigger      = active_trigger_;
-    snapshot_.peak_g       = peak_g_;
-    ring_.copy_chronological(snapshot_.samples);
-
-    // Build packed IncidentRecord in static .bss record_buf_
-    std::memset(&record_buf_, 0, sizeof(record_buf_));
-    record_buf_.magic        = edr::kRecordMagic;
-    record_buf_.event_id     = new_id;
-    record_buf_.timestamp_ms = trigger_time_ms_;
-    record_buf_.peak_g_x100  = static_cast<uint16_t>(peak_g_ * 100.0f + 0.5f);
-    record_buf_.trigger_type = static_cast<uint8_t>(active_trigger_);
-    record_buf_.temp_c_x10   = 0; // Populated from DHT11 on Day 4
-    record_buf_.humidity_x10 = 0;
-
-    const auto& mac = storage_.cached_mac();
-    std::memcpy(record_buf_.device_mac, mac.data(), mac.size());
-
-    // Chain to previous record (or RNG genesis seed for Event #1)
-    record_buf_.prev_crc32 = last_crc32_;
-    std::memcpy(record_buf_.samples, snapshot_.samples.data(), sizeof(record_buf_.samples));
-
-    // Hardware CRC-32 over all preceding 458 words (1,832 bytes)
-    record_buf_.record_crc32 = stm32f407::hw_security::compute_crc32(
-        &record_buf_, offsetof(edr::IncidentRecord, record_crc32));
-
-    // Commit to 4 KB Flash sector (only if storage is ready and within slot budget)
-    if (storage_.is_ready() && slot < kMaxEvents) {
-        if (storage_.write_sector(slot,
-                                  reinterpret_cast<const uint8_t*>(&record_buf_),
-                                  sizeof(record_buf_))) {
-            last_crc32_ = record_buf_.record_crc32;
-        }
-    }
-
-    event_count_  = new_id;
-    last_trigger_ = active_trigger_;
-    led_ticks_    = kLedBlinkTicks; // 3 crisp non-blocking Red LED (PD14) flashes
-}
-
-// ---------------------------------------------------------------------------
-// 5. Simulate Tamper Action (Triggered by SW4 inside 50 Hz Task)
+// 4. SW4 Live Tamper Test: Flip 1 Bit in Sector 0 Without Updating CRC-32
 // ---------------------------------------------------------------------------
 void EdrController::simulate_tamper() {
-    if (!storage_.is_ready() || event_count_ == 0U) {
+    if (!storage_.is_ready() || !has_crash_) {
         return;
     }
 
-    const uint32_t latest_slot = event_count_ - 1U;
-
-    // 1. Read the latest valid record from Flash
-    if (!storage_.read_sector(latest_slot,
-                              reinterpret_cast<uint8_t*>(&record_buf_),
-                              sizeof(record_buf_))) {
+    if (!storage_.read_sector(kFlashSector,
+                              reinterpret_cast<uint8_t*>(&record_),
+                              sizeof(record_))) {
         return;
     }
 
-    // 2. Flip 1 single bit in the impact sample (index 100, Z-axis accel)
-    //    WITHOUT updating record_crc32
-    record_buf_.samples[100].az ^= 0x0001;
+    // Flip 1 LSB (0.000244 g) at sample 100 (t = 0 impact boundary) without recomputing CRC
+    record_.samples[100].az = static_cast<int16_t>(record_.samples[100].az ^ 1);
 
-    // 3. Write the corrupted record back into the same 4 KB Flash sector
-    if (storage_.write_sector(latest_slot,
-                              reinterpret_cast<const uint8_t*>(&record_buf_),
-                              sizeof(record_buf_))) {
-        // 4. Re-verify chain immediately so LCD flags "TAMPER!" right away
-        verify_chain(event_count_);
-        led_ticks_ = kLedBlinkTicks;
+    if (storage_.write_sector(kFlashSector,
+                              reinterpret_cast<const uint8_t*>(&record_),
+                              sizeof(record_))) {
+        const uint32_t calc = compute_crc32(&record_, offsetof(edr::CrashRecord, crc32));
+        crc_ok_ = (calc == record_.crc32); // Immediately flips to false
+        set_red_led(!crc_ok_);             // Immediately lights Red LED solid ON
     }
 }
