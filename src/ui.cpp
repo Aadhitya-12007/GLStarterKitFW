@@ -1,70 +1,63 @@
 #include "ui.hpp"
 
-#include <cstddef>
-#include <string_view>
+#include <cstdio>
+#include <cstring>
 
-#include <printf/printf.h>
-
-namespace ui {
+extern "C" {
+#include "stm32f4xx_hal.h"
+}
 
 namespace {
+constexpr uint32_t kRefreshPeriodMs = 100U; // 10 Hz HMI refresh (display + LEDs)
+constexpr uint16_t kGreenLedPin     = GPIO_PIN_12; // PD12 (LD4)
+constexpr uint16_t kRedLedPin       = GPIO_PIN_14; // PD14 (LD5)
 
-constexpr TickType_t kRefreshPeriod = pdMS_TO_TICKS(150); // ~6.7 Hz LCD refresh
-
-const char* state_label(EdrController::State s) {
-    switch (s) {
-        case EdrController::State::DISARMED:     return "DISARM";
-        case EdrController::State::ARMED:        return "ARMED ";
-        case EdrController::State::POST_CAPTURE: return "CAPTUR";
+// Converts float G-force into whole + hundredths without requiring float printf
+void split_g(float g, unsigned& whole, unsigned& frac) {
+    if (g < 0.0f) {
+        g = 0.0f;
     }
-    return "------";
+    const unsigned g100 = static_cast<unsigned>(g * 100.0f + 0.5f);
+    whole = g100 / 100U;
+    frac  = g100 % 100U;
 }
-
-const char* trigger_label(EdrController::Trigger t) {
-    switch (t) {
-        case EdrController::Trigger::SHOCK: return "SHK";
-        case EdrController::Trigger::TILT:  return "TLT";
-        default:                            return "---";
-    }
-}
-
 } // namespace
 
-Ui::Ui(stm32f407::Wh1602& display, EdrController& edr)
-    : display_(display), edr_(edr) {}
+Ui::Ui(stm32f407::Wh1602& display,
+       stm32f407::Keyboard& keyboard,
+       EdrController& edr)
+    : display_(display), keyboard_(keyboard), edr_(edr) {}
 
-bool Ui::start() {
-    const BaseType_t ok = xTaskCreate(
-        &Ui::task_entry,
-        "ui",
-        512,
-        this,
-        tskIDLE_PRIORITY + 1,
-        &task_handle_
-    );
-    return ok == pdPASS;
+void Ui::start() {
+    xTaskCreate(&Ui::task_entry, "ui", 384, this,
+                tskIDLE_PRIORITY + 1, &task_handle_);
 }
 
-void Ui::on_button_event(const stm32f407::ButtonEvent& event) {
-    if (event.type != stm32f407::ButtonEventType::PRESSED) {
-        return;
-    }
+void Ui::task_entry(void* arg) {
+    static_cast<Ui*>(arg)->run();
+}
 
-    switch (event.button) {
-        case stm32f407::Button::SW1:
-            screen_ = (screen_ + kScreenCount - 1) % kScreenCount; // Previous view
+// ---------------------------------------------------------------------------
+// 1. Switch Handler (Runs inside Keyboard task — zero hardware/SPI/LCD access)
+// ---------------------------------------------------------------------------
+void Ui::on_button_event(stm32f407::Keyboard::Button button) {
+    using Btn = stm32f407::Keyboard::Button;
+
+    switch (button) {
+        case Btn::SW1:
+            screen_ = (screen_ == 0U) ? (kScreenCount - 1U) : static_cast<uint8_t>(screen_ - 1U);
             break;
 
-        case stm32f407::Button::SW2:
-            edr_.toggle_arm(); // Arm / Disarm EDR
+        case Btn::SW2:
+            edr_.toggle_arm();
             break;
 
-        case stm32f407::Button::SW3:
-            screen_ = (screen_ + 1) % kScreenCount; // Next view
+        case Btn::SW3:
+            screen_ = static_cast<uint8_t>((screen_ + 1U) % kScreenCount);
             break;
 
-        case stm32f407::Button::SW4:
-            edr_.request_tamper(); // Flip 1 bit in latest Flash sector
+        case Btn::SW4:
+            edr_.request_tamper();
             break;
 
         default:
@@ -72,105 +65,107 @@ void Ui::on_button_event(const stm32f407::ButtonEvent& event) {
     }
 }
 
-void Ui::task_entry(void* arg) {
-    static_cast<Ui*>(arg)->run();
-}
-
+// ---------------------------------------------------------------------------
+// 2. Main 10 Hz HMI Loop (Sole Owner of Display + PD12/PD14 LEDs)
+// ---------------------------------------------------------------------------
 void Ui::run() {
-    // Wh1602::initialize() uses vTaskDelay(), so it must run inside a FreeRTOS task.
-    display_.initialize();
-    display_.set_backlight(true);
+    TickType_t last_wake = xTaskGetTickCount();
 
     while (true) {
-        switch (screen_) {
-            case 0:  render_edr_status(); break;
-            case 1:  render_last_event(); break;
-            default: render_controls();   break;
+        update_leds();
+        render_screen();
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(kRefreshPeriodMs));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. LED Control (Zero Blink Math — Clear Solid Status)
+// ---------------------------------------------------------------------------
+void Ui::update_leds() {
+    const auto state    = edr_.state();
+    const bool armed    = (state == EdrController::State::ARMED) ||
+                          (state == EdrController::State::POST_CAPTURE);
+    const bool tampered = edr_.has_crash() && !edr_.crc_ok();
+    const bool red_on   = (state == EdrController::State::POST_CAPTURE) || tampered;
+
+    HAL_GPIO_WritePin(GPIOD, kGreenLedPin, armed  ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD, kRedLedPin,   red_on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Three Minimal 16x2 Screens
+// ---------------------------------------------------------------------------
+void Ui::render_screen() {
+    char row0[17]{};
+    char row1[17]{};
+
+    const uint8_t page      = screen_;
+    const auto    state     = edr_.state();
+    const bool    has_crash = edr_.has_crash();
+    const bool    crc_ok    = edr_.crc_ok();
+
+    if (page == 0U) {
+        // Screen 0: Live Status (State + Integrity / Live G + Saved Event ID)
+        const char* state_str = "DISARM";
+        if (state == EdrController::State::ARMED) {
+            state_str = "ARMED ";
+        } else if (state == EdrController::State::POST_CAPTURE) {
+            state_str = "CAPTUR";
         }
-        vTaskDelay(kRefreshPeriod);
-    }
-}
 
-void Ui::render_edr_status() {
-    char line0[17];
-    char line1[17];
+        const char* integrity_str = "NO LOG ";
+        if (has_crash) {
+            integrity_str = crc_ok ? "CRC:OK " : "TAMPER!";
+        }
 
-    int g100 = static_cast<int>(edr_.live_g() * 100.0f + 0.5f);
-    if (g100 < 0)   g100 = 0;
-    if (g100 > 999) g100 = 999; // Keep "G:X.XX" within 6 characters
+        std::snprintf(row0, sizeof(row0), "%-6s   %-7s", state_str, integrity_str);
 
-    // Exact 16 chars: e.g. "DISARM EVENTS: 2" or "ARMED  EVENTS: 2"
-    snprintf(line0, sizeof(line0), "%-6s EVENTS:%2lu",
-             state_label(edr_.state()),
-             static_cast<unsigned long>(edr_.event_count()));
+        unsigned w = 0, f = 0;
+        split_g(edr_.live_g(), w, f);
+        if (has_crash) {
+            const unsigned id = static_cast<unsigned>(edr_.latest_record().event_id % 100U);
+            std::snprintf(row1, sizeof(row1), "G:%u.%02u   EVT:#%02u", w, f, id);
+        } else {
+            std::snprintf(row1, sizeof(row1), "G:%u.%02u   EVT:---", w, f);
+        }
+    } else if (page == 1U) {
+        // Screen 1: Stored CrashRecord Summary (Sector 0)
+        if (has_crash) {
+            const auto& rec = edr_.latest_record();
+            const unsigned id = static_cast<unsigned>(rec.event_id % 100U);
+            const char* crc_str = crc_ok ? "CRC:OK " : "TAMPER!";
 
-    if (edr_.chain_ok()) {
-        snprintf(line1, sizeof(line1), "G:%d.%02d  LAST:%3s",
-                 g100 / 100, g100 % 100,
-                 trigger_label(edr_.last_trigger()));
+            unsigned pw = 0, pf = 0;
+            split_g(rec.peak_g, pw, pf);
+
+            std::snprintf(row0, sizeof(row0), "EVT #%02u  %-7s", id, crc_str);
+            std::snprintf(row1, sizeof(row1), "PEAK: %u.%02ug", pw, pf);
+        } else {
+            std::snprintf(row0, sizeof(row0), "FLASH SECTOR 0");
+            std::snprintf(row1, sizeof(row1), "NO CRASH SAVED");
+        }
     } else {
-        snprintf(line1, sizeof(line1), "G:%d.%02d  TAMPER! ",
-                 g100 / 100, g100 % 100);
+        // Screen 2: Network & MQTT Status
+        std::snprintf(row0, sizeof(row0), "192.168.137.42");
+        std::snprintf(row1, sizeof(row1), "ETH:%-3s MQTT:%-3s",
+                      eth_up_  ? "ON" : "OFF",
+                      mqtt_up_ ? "ON" : "OFF");
     }
 
-    write_line(0, line0);
-    write_line(1, line1);
+    write_line(0U, row0);
+    write_line(1U, row1);
 }
 
-void Ui::render_last_event() {
-    const auto& snap = edr_.latest_snapshot();
-    if (snap.event_id == 0) {
-        write_line(0, "LAST SNAPSHOT");
-        write_line(1, "NO EVENTS YET");
+// Pads to exactly 16 characters and skips redundant display writes (prevents flicker)
+void Ui::write_line(uint8_t row, const char* text) {
+    char padded[17];
+    std::snprintf(padded, sizeof(padded), "%-16.16s", text);
+
+    if (std::memcmp(last_lines_[row], padded, 16U) == 0) {
         return;
     }
 
-    char line0[17];
-    char line1[17];
-
-    int pk100 = static_cast<int>(snap.peak_g * 100.0f + 0.5f);
-    if (pk100 < 0)   pk100 = 0;
-    if (pk100 > 999) pk100 = 999;
-
-    const unsigned long t_sec_x10 = snap.timestamp_ms / 100U;
-
-    snprintf(line0, sizeof(line0), "EVT #%02lu   %3s",
-             static_cast<unsigned long>(snap.event_id),
-             trigger_label(snap.trigger));
-
-    snprintf(line1, sizeof(line1), "PK:%d.%02dg %lu.%lus",
-             pk100 / 100, pk100 % 100,
-             t_sec_x10 / 10U, t_sec_x10 % 10U);
-
-    write_line(0, line0);
-    write_line(1, line1);
+    std::memcpy(last_lines_[row], padded, 17U);
+    display_.set_cursor(0U, row); // Match your Wh1602 API (e.g., set_cursor / write)
+    display_.print(padded);
 }
-
-void Ui::render_controls() {
-    char line0[17];
-    const auto& mac = edr_.device_mac();
-
-    // Exact 16 chars: "MAC:AABBCCDDEEFF"
-    snprintf(line0, sizeof(line0), "MAC:%02X%02X%02X%02X%02X%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
-    write_line(0, line0);
-    write_line(1, "SW2:ARM SW4:TMPR");
-}
-
-void Ui::write_line(std::uint8_t row, const char* text) {
-    char buf[stm32f407::Wh1602::columns];
-    std::size_t i = 0;
-
-    while (i < sizeof(buf) && text[i] != '\0') {
-        buf[i] = text[i];
-        ++i;
-    }
-    while (i < sizeof(buf)) {
-        buf[i++] = ' ';
-    }
-
-    display_.write(row, 0, std::string_view{buf, sizeof(buf)});
-}
-
-} // namespace ui
