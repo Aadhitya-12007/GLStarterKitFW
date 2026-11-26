@@ -11,7 +11,6 @@ add_library(stm32f407_platform OBJECT
     src/system.cpp
     src/wh1602.cpp
     src/blackbox_storage.cpp
-    src/hw_security.cpp
     ${PROJECT_SOURCE_DIR}/third_party/cmsis-device-f4/Source/Templates/gcc/startup_stm32f407xx.s
 )
 
