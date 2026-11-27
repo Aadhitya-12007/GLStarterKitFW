@@ -66,10 +66,6 @@ std::uint32_t current_time_ms()
     return xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
-void ignore_incoming_publish(MQTTAgentContext_t*, std::uint16_t, MQTTPublishInfo_t*)
-{
-}
-
 void notify_command_complete(MQTTAgentCommandContext_t* context,
                              MQTTAgentReturnInfo_t* result)
 {
@@ -98,6 +94,12 @@ bool MqttClient::add_broker_connection_listener(IBrokerConnectionListener& liste
     listeners_[listener_count_] = &listener;
     ++listener_count_;
     return true;
+}
+
+void MqttClient::set_message_listener(IMqttMessageListener& listener)
+{
+    configASSERT(!started_);
+    message_listener_ = &listener;
 }
 
 bool MqttClient::start()
@@ -130,8 +132,8 @@ bool MqttClient::start()
                        &buffer,
                        &transport,
                        current_time_ms,
-                       ignore_incoming_publish,
-                       nullptr,
+                       incoming_publish_callback,
+                       this,
                        nullptr,
                        0U) != MQTTSuccess) {
         return false;
@@ -171,7 +173,7 @@ bool MqttClient::publish(const char* topic, const char* payload)
     MQTTPublishInfo_t message{};
     message.qos = MQTTQoS0;
     message.pTopicName = topic;
-    message.topicNameLength = std::strlen(topic);
+    message.topicNameLength = static_cast<std::uint16_t>(std::strlen(topic));
     message.pPayload = payload;
     message.payloadLength = std::strlen(payload);
 
@@ -185,6 +187,45 @@ bool MqttClient::publish(const char* topic, const char* payload)
     // The agent keeps pointers to the locals above until it completes the command.
     (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     return completion.status == MQTTSuccess;
+}
+
+bool MqttClient::subscribe(const char* topic)
+{
+    if (!connected_) {
+        return false;
+    }
+
+    MQTTSubscribeInfo_t subscription{};
+    subscription.qos = MQTTQoS0;
+    subscription.pTopicFilter = topic;
+    subscription.topicFilterLength = static_cast<std::uint16_t>(std::strlen(topic));
+
+    MQTTAgentSubscribeArgs_t arguments{&subscription, 1U, nullptr};
+    MQTTAgentCommandContext_t completion{xTaskGetCurrentTaskHandle(), MQTTSuccess};
+    const MQTTAgentCommandInfo_t command{notify_command_complete, &completion, 0U};
+    if (MQTTAgent_Subscribe(&agent_, &arguments, &command) != MQTTSuccess) {
+        return false;
+    }
+
+    // The agent keeps pointers to the locals above until SUBACK arrives.
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return completion.status == MQTTSuccess;
+}
+
+void MqttClient::incoming_publish_callback(MQTTAgentContext_t* context,
+                                           std::uint16_t /*packet_id*/,
+                                           MQTTPublishInfo_t* publish_info)
+{
+    auto* self = static_cast<MqttClient*>(context->pIncomingCallbackContext);
+    if (self == nullptr || self->message_listener_ == nullptr || publish_info == nullptr) {
+        return;
+    }
+
+    self->message_listener_->on_mqtt_message(
+        publish_info->pTopicName,
+        publish_info->topicNameLength,
+        static_cast<const char*>(publish_info->pPayload),
+        publish_info->payloadLength);
 }
 
 void MqttClient::task_entry(void* context)
@@ -201,7 +242,7 @@ void MqttClient::run()
 
         if (connect_to_broker()) {
             retry_delay = min_retry_delay;
-            // Drop publishes queued before this connection existed.
+            // Drop commands queued before this connection existed.
             (void)MQTTAgent_CancelAll(&agent_);
             set_connected(true);
             // Returns once the connection fails.
@@ -236,7 +277,7 @@ bool MqttClient::connect_to_broker()
     connect_info.cleanSession = true;
     connect_info.keepAliveSeconds = keep_alive_seconds;
     connect_info.pClientIdentifier = client_id_;
-    connect_info.clientIdentifierLength = std::strlen(client_id_);
+    connect_info.clientIdentifierLength = static_cast<std::uint16_t>(std::strlen(client_id_));
 
     bool session_present = false;
     return MQTT_Connect(&agent_.mqttContext,
