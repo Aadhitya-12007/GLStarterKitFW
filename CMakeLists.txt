@@ -32,7 +32,7 @@ add_executable(${PROJECT_NAME}
     src/tcp_echo_server.cpp
     src/temperature_publisher.cpp
     src/ui.cpp
-    include/incident_record.hpp
+    src/edr_mqtt.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE include)
