@@ -33,7 +33,7 @@ EdrController edr_controller{imu, storage};
 // Local UI and input peripherals.
 stm32f407::Keyboard keyboard;
 stm32f407::Wh1602 display;
-ui::Ui user_interface{display, edr_controller};
+Ui user_interface{display, edr_controller};
 
 // Ethernet + MQTT telemetry/command stack.
 network::Ethernet ethernet{Settings::ethernet_config};
